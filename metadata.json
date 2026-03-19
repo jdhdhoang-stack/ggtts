@@ -1,0 +1,5 @@
+{
+  "name": "Sound of Text Proxy",
+  "description": "Convert text to speech using Google Translate's engine. Supports multiple languages and direct audio downloads.",
+  "requestFramePermissions": []
+}
