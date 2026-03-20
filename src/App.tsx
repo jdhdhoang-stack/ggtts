@@ -308,9 +308,9 @@ const App = () => {
     return new Blob([buffer_out], { type: "audio/wav" });
   };
 
-  const mergeAudios = async (itemsToMerge: HistoryItem[], originalText: string): Promise<HistoryItem | null> => {
+  const mergeAudios = async (itemsToMerge: HistoryItem[], originalText: string, partLabel?: string): Promise<HistoryItem | null> => {
     setIsMerging(true);
-    setBatchProgress(prev => prev ? { ...prev, phase: 'Đang hợp nhất...' } : null);
+    setBatchProgress(prev => prev ? { ...prev, phase: partLabel ? `Đang hợp nhất ${partLabel}...` : 'Đang hợp nhất...' } : null);
     try {
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const buffers: AudioBuffer[] = [];
@@ -326,6 +326,15 @@ const App = () => {
       if (buffers.length === 0) return null;
 
       const totalLength = buffers.reduce((acc, buf) => acc + buf.length, 0);
+      
+      // Safety check: Browser limit for AudioBuffer is typically around 2GB or 1-2 billion samples.
+      // 923,194,368 samples at 48kHz is ~5.3 hours, which is too much for a single buffer.
+      // We'll set a limit of 300 million samples (~104 mins at 48kHz) to be safe.
+      const MAX_SAMPLES = 300_000_000;
+      if (totalLength > MAX_SAMPLES) {
+        throw new Error(`Tổng độ dài âm thanh của phần này quá lớn (${Math.round(totalLength / buffers[0].sampleRate / 60)} phút). Vui lòng chia nhỏ văn bản hơn nữa.`);
+      }
+
       const mergedBuffer = audioCtx.createBuffer(
         buffers[0].numberOfChannels,
         totalLength,
@@ -344,8 +353,8 @@ const App = () => {
       const wavUrl = URL.createObjectURL(wavBlob);
 
       return {
-        id: Date.now(),
-        text: `[GỘP TOÀN BỘ] ${originalText.slice(0, 100)}${originalText.length > 100 ? '...' : ''}`,
+        id: Date.now() + Math.random(),
+        text: `[${partLabel || 'GỘP TOÀN BỘ'}] ${originalText.slice(0, 100)}${originalText.length > 100 ? '...' : ''}`,
         langCode: itemsToMerge[0].langCode,
         langName: itemsToMerge[0].langName,
         url: wavUrl,
@@ -356,7 +365,7 @@ const App = () => {
       };
     } catch (err) {
       console.error("Merge error:", err);
-      setError("Không thể hợp nhất các đoạn âm thanh. Vui lòng tải từng phần.");
+      setError(err instanceof Error ? err.message : "Không thể hợp nhất các đoạn âm thanh. Vui lòng tải từng phần.");
       return null;
     } finally {
       setIsMerging(false);
@@ -480,14 +489,24 @@ const App = () => {
         setItems(prev => [successfulItems[0], ...prev]);
       } else {
         if (successfulItems.length === chunks.length) {
-          setBatchProgress({ current: 0, total: 1, phase: 'Đang hợp nhất các phần...' });
-          const mergedItem = await mergeAudios(successfulItems, inputText);
-          if (mergedItem) {
-            // Merged item at the top, then individual chunks
-            setItems(prev => [mergedItem, ...successfulItems, ...prev]);
-          } else {
-            setItems(prev => [...successfulItems, ...prev]);
+          const numParts = 4;
+          const partSize = Math.ceil(successfulItems.length / numParts);
+          const mergedParts: HistoryItem[] = [];
+
+          for (let i = 0; i < numParts; i++) {
+            const start = i * partSize;
+            const end = Math.min((i + 1) * partSize, successfulItems.length);
+            if (start >= end) continue;
+
+            const partItems = successfulItems.slice(start, end);
+            setBatchProgress({ current: i, total: numParts, phase: `Đang hợp nhất Phần ${i + 1}...` });
+            const merged = await mergeAudios(partItems, inputText, `GỘP PHẦN ${i + 1}`);
+            if (merged) mergedParts.push(merged);
           }
+
+          // Reverse to keep chronological order (newest at top)
+          const newItems: HistoryItem[] = [...mergedParts.reverse(), ...successfulItems];
+          setItems(prev => [...newItems, ...prev]);
         } else {
           setItems(prev => [...successfulItems, ...prev]);
           setError(`Hoàn thành ${successfulItems.length}/${chunks.length} phần. Một số phần không thể tạo sau ${MAX_RETRIES} lần thử.`);
@@ -702,6 +721,7 @@ const App = () => {
                     <textarea
                       value={text}
                       onChange={(e) => setText(e.target.value)}
+                      maxLength={100000}
                       placeholder="Nhập hoặc dán văn bản..."
                       className="w-full h-44 p-5 rounded-2xl border border-slate-800/50 bg-black/40 focus:bg-black/60 focus:ring-1 focus:ring-indigo-500/30 focus:border-indigo-500/30 outline-none transition-all resize-none text-base leading-relaxed text-slate-300 placeholder:text-slate-700"
                     />
@@ -992,6 +1012,7 @@ const App = () => {
                 <textarea
                   value={filterInput}
                   onChange={(e) => setFilterInput(e.target.value)}
+                  maxLength={100000}
                   placeholder="Dán văn bản cần lọc vào đây..."
                   className="w-full h-44 p-5 rounded-2xl border border-slate-800/50 bg-black/40 focus:bg-black/60 focus:ring-1 focus:ring-amber-500/30 focus:border-amber-500/30 outline-none transition-all resize-none text-base leading-relaxed text-slate-300 placeholder:text-slate-700"
                 />
