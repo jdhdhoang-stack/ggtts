@@ -16,7 +16,8 @@ import {
   Filter,
   Mic2,
   Copy,
-  Eraser
+  Eraser,
+  Clock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -43,8 +44,8 @@ interface HistoryItem {
   url: string;
   timestamp: string;
   isMerged?: boolean;
-  speed?: number;
-  pitch?: number;
+  speed: number;
+  pitch: number;
 }
 
 const App = () => {
@@ -56,6 +57,7 @@ const App = () => {
   const [isMerging, setIsMerging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; phase: string } | null>(null);
+  const [pauseDuration, setPauseDuration] = useState(0.1);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [activeAudio, setActiveAudio] = useState<{ id: number; source: HTMLAudioElement; ctx: AudioContext | null } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -254,6 +256,52 @@ const App = () => {
     localStorage.setItem('trash_keywords', trashKeywords);
   }, [trashKeywords]);
 
+  // Helper to trim silence from AudioBuffer
+  const trimSilence = (buffer: AudioBuffer, threshold = 0.01): AudioBuffer => {
+    const numChannels = buffer.numberOfChannels;
+    const length = buffer.length;
+    const sampleRate = buffer.sampleRate;
+    
+    let start = 0;
+    let end = length - 1;
+    
+    // Find first sample above threshold
+    for (let i = 0; i < length; i++) {
+      let maxVal = 0;
+      for (let c = 0; c < numChannels; c++) {
+        maxVal = Math.max(maxVal, Math.abs(buffer.getChannelData(c)[i]));
+      }
+      if (maxVal > 0.005) {
+        start = i;
+        break;
+      }
+    }
+    
+    // Find last sample above threshold
+    for (let i = length - 1; i >= start; i--) {
+      let maxVal = 0;
+      for (let c = 0; c < numChannels; c++) {
+        maxVal = Math.max(maxVal, Math.abs(buffer.getChannelData(c)[i]));
+      }
+      if (maxVal > 0.005) {
+        end = i;
+        break;
+      }
+    }
+    
+    const newLength = end - start + 1;
+    if (newLength <= 0) return buffer;
+    
+    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const newBuffer = audioCtx.createBuffer(numChannels, newLength, sampleRate);
+    
+    for (let c = 0; c < numChannels; c++) {
+      newBuffer.getChannelData(c).set(buffer.getChannelData(c).subarray(start, end + 1));
+    }
+    
+    return newBuffer;
+  };
+
   // Helper to convert AudioBuffer to WAV Blob
   const audioBufferToWav = (buffer: AudioBuffer) => {
     const numOfChan = buffer.numberOfChannels;
@@ -320,12 +368,17 @@ const App = () => {
         const response = await fetch(item.url);
         const arrayBuffer = await response.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-        buffers.push(audioBuffer);
+        // Trim silence from each chunk to allow custom pause duration
+        const trimmed = trimSilence(audioBuffer);
+        buffers.push(trimmed);
       }
 
       if (buffers.length === 0) return null;
 
-      const totalLength = buffers.reduce((acc, buf) => acc + buf.length, 0);
+      const pauseSamples = Math.floor(pauseDuration * buffers[0].sampleRate);
+      const totalLength = buffers.reduce((acc, buf, idx) => 
+        acc + buf.length + (idx < buffers.length - 1 ? pauseSamples : 0), 0
+      );
       
       // Safety check: Browser limit for AudioBuffer is typically around 2GB or 1-2 billion samples.
       // 923,194,368 samples at 48kHz is ~5.3 hours, which is too much for a single buffer.
@@ -342,11 +395,15 @@ const App = () => {
       );
 
       let offset = 0;
-      for (const buf of buffers) {
+      for (let i = 0; i < buffers.length; i++) {
+        const buf = buffers[i];
         for (let channel = 0; channel < buf.numberOfChannels; channel++) {
           mergedBuffer.getChannelData(channel).set(buf.getChannelData(channel), offset);
         }
         offset += buf.length;
+        if (i < buffers.length - 1) {
+          offset += pauseSamples;
+        }
       }
 
       const wavBlob = audioBufferToWav(mergedBuffer);
@@ -444,8 +501,13 @@ const App = () => {
             const blob = await response.blob();
             if (blob.size < 100) throw new Error("Audio blob too small (likely invalid)");
             
-            blobs[index] = blob;
-            const blobUrl = URL.createObjectURL(blob);
+            // Trim silence from individual chunk
+            const arrayBuffer = await blob.arrayBuffer();
+            const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+            const trimmed = trimSilence(audioBuffer);
+            const trimmedBlob = audioBufferToWav(trimmed);
+            const blobUrl = URL.createObjectURL(trimmedBlob);
 
             results[index] = {
               id: Date.now() + index + Math.random(),
@@ -453,7 +515,9 @@ const App = () => {
               langCode: targetLang,
               langName: LANGUAGES.find(l => l.code === targetLang)?.name || targetLang,
               url: blobUrl,
-              timestamp: new Date().toLocaleTimeString()
+              timestamp: new Date().toLocaleTimeString(),
+              speed: 1,
+              pitch: 0
             };
           } catch (err) {
             console.error(`Failed to process chunk ${index}:`, err);
@@ -627,13 +691,71 @@ const App = () => {
     }
   };
 
-  const downloadAudio = (url: string, filename: string) => {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${filename.slice(0, 50).replace(/[^a-z0-9]/gi, '_')}.wav`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  const downloadAudio = async (item: HistoryItem) => {
+    const speed = item.speed || 1;
+    const pitch = item.pitch || 0;
+
+    // If no adjustments, just download the original URL
+    if (speed === 1 && pitch === 0) {
+      const a = document.createElement('a');
+      a.href = item.url;
+      a.download = `${item.text.slice(0, 50).replace(/[^a-z0-9]/gi, '_')}.wav`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const response = await fetch(item.url);
+      const arrayBuffer = await response.arrayBuffer();
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      
+      // Calculate new length based on speed
+      // Note: playbackRate in OfflineAudioContext changes pitch too.
+      // To preserve pitch while changing speed (time-stretching) is complex without a library.
+      // We apply playbackRate to at least reflect the speed change in the download.
+      const newLength = Math.floor(audioBuffer.length / speed);
+      const offlineCtx = new OfflineAudioContext(
+        audioBuffer.numberOfChannels,
+        newLength,
+        audioBuffer.sampleRate
+      );
+
+      const source = offlineCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.playbackRate.setValueAtTime(speed, 0);
+
+      const filter = offlineCtx.createBiquadFilter();
+      filter.type = 'peaking';
+      filter.frequency.value = 1000;
+      filter.Q.value = 1;
+      filter.gain.value = pitch * 1.5;
+
+      source.connect(filter);
+      filter.connect(offlineCtx.destination);
+      
+      source.start(0);
+      const renderedBuffer = await offlineCtx.startRendering();
+      const wavBlob = audioBufferToWav(renderedBuffer);
+      const wavUrl = URL.createObjectURL(wavBlob);
+      
+      const a = document.createElement('a');
+      a.href = wavUrl;
+      a.download = `${item.text.slice(0, 50).replace(/[^a-z0-9]/gi, '_')}_mod.wav`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      
+      setTimeout(() => URL.revokeObjectURL(wavUrl), 10000);
+    } catch (err) {
+      console.error("Download error:", err);
+      setError("Lỗi khi xử lý âm thanh: " + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -745,6 +867,24 @@ const App = () => {
                         </svg>
                       </div>
                     </div>
+
+                    {/* Pause Duration Slider */}
+                    <div className="flex-1 bg-black/40 rounded-xl border border-slate-800/50 p-3 flex flex-col justify-center">
+                      <div className="flex justify-between items-center mb-1.5 px-1">
+                        <label className="text-[9px] font-bold text-slate-600 uppercase tracking-widest">Khoảng nghỉ: {pauseDuration}s</label>
+                        <Clock className="w-3 h-3 text-slate-600" />
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={pauseDuration}
+                        onChange={(e) => setPauseDuration(parseFloat(e.target.value))}
+                        className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                      />
+                    </div>
+
                     <button
                       type="submit"
                       disabled={loading || !text.trim()}
@@ -911,7 +1051,7 @@ const App = () => {
                                 {item.isMerged && <span className="text-xs font-bold uppercase tracking-widest">Nghe</span>}
                               </button>
                               <button
-                                onClick={() => downloadAudio(item.url, item.text)}
+                                onClick={() => downloadAudio(item)}
                                 className={`p-3 rounded-xl transition-all active:scale-90 ${
                                   item.isMerged ? 'text-amber-500 bg-amber-900/10 hover:bg-amber-900/20' : 'text-slate-400 bg-slate-800/40 hover:bg-slate-800/60'
                                 }`}
@@ -927,51 +1067,49 @@ const App = () => {
                             </div>
                           </div>
 
-                          {/* Controls for Merged Audio */}
-                          {item.isMerged && (
-                            <div className="pt-5 border-t border-amber-900/20 grid grid-cols-1 sm:grid-cols-2 gap-8">
-                              <div className="space-y-4">
-                                <div className="flex justify-between items-center">
-                                  <label className="text-[9px] font-bold text-amber-600/80 uppercase tracking-[0.2em]">Tốc độ: {item.speed}x</label>
-                                  <button 
-                                    onClick={() => updateItemSettings(item.id, 1, item.pitch || 0)}
-                                    className="text-[8px] text-amber-700 font-bold hover:underline uppercase tracking-widest"
-                                  >
-                                    Reset
-                                  </button>
-                                </div>
-                                <input 
-                                  type="range" 
-                                  min="0.5" 
-                                  max="2" 
-                                  step="0.1" 
-                                  value={item.speed || 1}
-                                  onChange={(e) => updateItemSettings(item.id, parseFloat(e.target.value), item.pitch || 0)}
-                                  className="w-full h-1 bg-black rounded-lg appearance-none cursor-pointer accent-amber-600"
-                                />
+                          {/* Controls for Audio Settings */}
+                          <div className={`pt-5 border-t ${item.isMerged ? 'border-amber-900/20' : 'border-slate-800/20'} grid grid-cols-1 sm:grid-cols-2 gap-8`}>
+                            <div className="space-y-4">
+                              <div className="flex justify-between items-center">
+                                <label className={`text-[9px] font-bold ${item.isMerged ? 'text-amber-600/80' : 'text-slate-500'} uppercase tracking-[0.2em]`}>Tốc độ: {item.speed}x</label>
+                                <button 
+                                  onClick={() => updateItemSettings(item.id, 1, item.pitch)}
+                                  className={`text-[8px] ${item.isMerged ? 'text-amber-700' : 'text-indigo-500'} font-bold hover:underline uppercase tracking-widest`}
+                                >
+                                  Reset
+                                </button>
                               </div>
-                              <div className="space-y-4">
-                                <div className="flex justify-between items-center">
-                                  <label className="text-[9px] font-bold text-amber-600/80 uppercase tracking-[0.2em]">Tông giọng: {item.pitch > 0 ? `+${item.pitch}` : item.pitch}</label>
-                                  <button 
-                                    onClick={() => updateItemSettings(item.id, item.speed || 1, 0)}
-                                    className="text-[8px] text-amber-700 font-bold hover:underline uppercase tracking-widest"
-                                  >
-                                    Reset
-                                  </button>
-                                </div>
-                                <input 
-                                  type="range" 
-                                  min="-10" 
-                                  max="10" 
-                                  step="1" 
-                                  value={item.pitch || 0}
-                                  onChange={(e) => updateItemSettings(item.id, item.speed || 1, parseInt(e.target.value))}
-                                  className="w-full h-1 bg-black rounded-lg appearance-none cursor-pointer accent-amber-600"
-                                />
-                              </div>
+                              <input 
+                                type="range" 
+                                min="0.5" 
+                                max="2" 
+                                step="0.1" 
+                                value={item.speed}
+                                onChange={(e) => updateItemSettings(item.id, parseFloat(e.target.value), item.pitch)}
+                                className={`w-full h-1 bg-black rounded-lg appearance-none cursor-pointer ${item.isMerged ? 'accent-amber-600' : 'accent-indigo-600'}`}
+                              />
                             </div>
-                          )}
+                            <div className="space-y-4">
+                              <div className="flex justify-between items-center">
+                                <label className={`text-[9px] font-bold ${item.isMerged ? 'text-amber-600/80' : 'text-slate-500'} uppercase tracking-[0.2em]`}>Tông giọng: {item.pitch > 0 ? `+${item.pitch}` : item.pitch}</label>
+                                <button 
+                                  onClick={() => updateItemSettings(item.id, item.speed, 0)}
+                                  className={`text-[8px] ${item.isMerged ? 'text-amber-700' : 'text-indigo-500'} font-bold hover:underline uppercase tracking-widest`}
+                                >
+                                  Reset
+                                </button>
+                              </div>
+                              <input 
+                                type="range" 
+                                min="-10" 
+                                max="10" 
+                                step="1" 
+                                value={item.pitch}
+                                onChange={(e) => updateItemSettings(item.id, item.speed, parseInt(e.target.value))}
+                                className={`w-full h-1 bg-black rounded-lg appearance-none cursor-pointer ${item.isMerged ? 'accent-amber-600' : 'accent-indigo-600'}`}
+                              />
+                            </div>
+                          </div>
                         </motion.div>
                       ))
                     )}
